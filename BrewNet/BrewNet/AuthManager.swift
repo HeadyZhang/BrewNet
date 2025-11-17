@@ -3,6 +3,411 @@ import SwiftUI
 import AuthenticationServices
 import Supabase
 
+// MARK: - LinkedIn Authentication Manager
+class LinkedInAuthManager: NSObject, ObservableObject {
+    @Published var isAuthenticating = false
+    @Published var error: String? {
+        didSet {
+            // 当发生错误时，通知界面层停止 loading，并展示错误信息
+            if let message = error {
+                NotificationCenter.default.post(
+                    name: Notification.Name("LinkedInProfileFailed"),
+                    object: nil,
+                    userInfo: ["error": message]
+                )
+            }
+        }
+    }
+
+    private var authSession: ASWebAuthenticationSession?
+    private let clientId = "782dcovcs9zyfv"
+    private let redirectURI = "https://jcxvdolcdifdghaibspy.supabase.co/functions/v1/linkedin-callback"
+    private let appScheme = "brewnet"
+    private var currentState: String?
+
+    // MARK: - LinkedIn OAuth Flow
+    func startLinkedInLogin() {
+        isAuthenticating = true
+        error = nil
+
+        let state = UUID().uuidString
+        currentState = state
+        let scope = "openid profile email"
+
+        // Fix 1: Use urlQueryAllowed instead of urlHostAllowed to preserve slashes and colons
+        let encodedRedirectURI = redirectURI.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? redirectURI
+        let encodedScope = scope.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? scope
+
+        let authURLString =
+        "https://www.linkedin.com/oauth/v2/authorization" +
+        "?response_type=code" +
+        "&client_id=\(clientId)" +
+        "&redirect_uri=\(encodedRedirectURI)" +
+        "&state=\(state)" +
+        "&scope=\(encodedScope)"
+
+        guard let authURL = URL(string: authURLString) else {
+            error = "Failed to create LinkedIn authorization URL"
+            isAuthenticating = false
+            return
+        }
+
+        // Fix 2: Use "brewnet" scheme to match the app scheme (callback server will redirect to brewnet://)
+        authSession = ASWebAuthenticationSession(
+            url: authURL,
+            callbackURLScheme: appScheme
+        ) { callbackURL, error in
+            if let error = error {
+                self.error = "Authentication failed: \(error.localizedDescription)"
+                self.isAuthenticating = false
+                return
+            }
+
+            if let callbackURL = callbackURL {
+                self.handleCallback(url: callbackURL)
+            }
+        }
+
+        authSession?.presentationContextProvider = self
+        authSession?.start()
+    }
+
+    func handleCallback(url: URL) {
+        print("🔗 LinkedIn callback received: \(url.absoluteString)")
+
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let code = components.queryItems?.first(where: { $0.name == "code" })?.value,
+              let stateReturned = components.queryItems?.first(where: { $0.name == "state" })?.value else {
+            error = "Invalid callback URL or missing authorization code"
+            isAuthenticating = false
+            return
+        }
+
+        // Verify state to prevent CSRF attacks
+        guard stateReturned == currentState else {
+            error = "State mismatch - possible CSRF attack"
+            isAuthenticating = false
+            return
+        }
+
+        print("✅ Received LinkedIn auth code: \(code)")
+        print("🔐 State verified: \(stateReturned)")
+
+        // Notify ProfileSetupView to handle the import
+        NotificationCenter.default.post(
+            name: Notification.Name("LinkedInCodeReceived"),
+            object: nil,
+            userInfo: ["code": code]
+        )
+    }
+
+    // Fix 4: Exchange code via backend API (client_secret must never be in mobile app)
+    private func exchangeCodeWithBackend(code: String) {
+        // Supabase Edge Function for token exchange
+        // This exchanges the authorization code for access token and fetches LinkedIn profile
+        let supabaseURL = "https://jcxvdolcdifdghaibspy.supabase.co"
+        guard let backendURL = URL(string: "\(supabaseURL)/functions/v1/linkedin-exchange") else {
+            DispatchQueue.main.async {
+                self.error = "Invalid backend URL configuration"
+                self.isAuthenticating = false
+            }
+            return
+        }
+
+        var request = URLRequest(url: backendURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: Any] = [
+            "code": code,
+            "redirect_uri": redirectURI
+        ]
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            DispatchQueue.main.async {
+                self.error = "Failed to encode request body: \(error.localizedDescription)"
+                self.isAuthenticating = false
+            }
+            return
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                DispatchQueue.main.async {
+                    self.error = "Backend exchange failed: \(error.localizedDescription)"
+                    self.isAuthenticating = false
+                }
+                return
+            }
+
+            guard let data = data else {
+                DispatchQueue.main.async {
+                    self.error = "No data received from backend"
+                    self.isAuthenticating = false
+                }
+                return
+            }
+
+            // Check HTTP status
+            if let httpResponse = response as? HTTPURLResponse,
+               httpResponse.statusCode != 200 {
+                DispatchQueue.main.async {
+                    if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        var errorMessage = "Backend error"
+                        
+                        // Try to get detailed error message
+                        if let errorMsg = errorJson["error"] as? String {
+                            errorMessage = errorMsg
+                            
+                            // Add detail if available
+                            if let detail = errorJson["detail"] as? String {
+                                errorMessage += ": \(detail)"
+                            }
+                            
+                            // Add hint if available
+                            if let hint = errorJson["hint"] as? String {
+                                errorMessage += "\n\n\(hint)"
+                            }
+                        } else if let detail = errorJson["detail"] as? String {
+                            errorMessage = detail
+                        } else {
+                            errorMessage = "Backend returned status \(httpResponse.statusCode)"
+                        }
+                        
+                        self.error = errorMessage
+                    } else {
+                        self.error = "Backend returned status \(httpResponse.statusCode)"
+                    }
+                    self.isAuthenticating = false
+                }
+                return
+            }
+
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    // Backend should return profile data directly (it already fetched profile + email)
+                    // Expected format: { "profile": { "localizedFirstName": "...", "localizedLastName": "...", "email": "...", ... } }
+                    if let profile = json["profile"] as? [String: Any] {
+                        print("✅ LinkedIn profile received from backend")
+                        DispatchQueue.main.async {
+                            self.isAuthenticating = false
+                            NotificationCenter.default.post(
+                                name: Notification.Name("LinkedInProfileFetched"),
+                                object: nil,
+                                userInfo: ["profile": profile]
+                            )
+                        }
+                    } else if let accessToken = json["access_token"] as? String {
+                        // If backend only returns token, fetch profile ourselves (fallback)
+                        print("✅ Access token received, fetching profile...")
+                    self.fetchLinkedInProfile(accessToken: accessToken)
+                } else {
+                    DispatchQueue.main.async {
+                            self.error = "Unexpected response format from backend"
+                            self.isAuthenticating = false
+                        }
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        self.error = "Failed to parse backend response"
+                        self.isAuthenticating = false
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.error = "Failed to decode backend response: \(error.localizedDescription)"
+                    self.isAuthenticating = false
+                }
+            }
+        }.resume()
+    }
+
+    private func fetchLinkedInProfile(accessToken: String) {
+        // Fix 5: Use OpenID Connect projection (required for v2 API)
+        let profileURL = URL(string: "https://api.linkedin.com/v2/me?projection=(id,localizedFirstName,localizedLastName,localizedHeadline,profilePicture(displayImage~:playableStreams))")!
+        var request = URLRequest(url: profileURL)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                DispatchQueue.main.async {
+                    self.error = "Failed to fetch LinkedIn profile: \(error.localizedDescription)"
+                    self.isAuthenticating = false
+                }
+                return
+            }
+
+            guard let data = data else {
+                DispatchQueue.main.async {
+                    self.error = "No profile data received"
+                    self.isAuthenticating = false
+                }
+                return
+            }
+
+            do {
+                if let profileJson = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    print("✅ LinkedIn profile received: \(profileJson)")
+
+                    // Fetch email separately
+                    self.fetchLinkedInEmail(accessToken: accessToken, profileData: profileJson)
+                } else {
+                    DispatchQueue.main.async {
+                        self.error = "Failed to parse LinkedIn profile"
+                        self.isAuthenticating = false
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.error = "Failed to decode profile response: \(error.localizedDescription)"
+                    self.isAuthenticating = false
+                }
+            }
+        }.resume()
+    }
+
+    private func fetchLinkedInEmail(accessToken: String, profileData: [String: Any]) {
+        let emailURL = URL(string: "https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))")!
+        var request = URLRequest(url: emailURL)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                DispatchQueue.main.async {
+                    self.error = "Failed to fetch LinkedIn email: \(error.localizedDescription)"
+                    self.isAuthenticating = false
+                }
+                return
+            }
+
+            guard let data = data else {
+                DispatchQueue.main.async {
+                    self.error = "No email data received"
+                    self.isAuthenticating = false
+                }
+                return
+            }
+
+            do {
+                if let emailJson = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let elements = emailJson["elements"] as? [[String: Any]],
+                   let firstElement = elements.first,
+                   let handle = firstElement["handle~"] as? [String: Any],
+                   let email = handle["emailAddress"] as? String {
+
+                    print("✅ LinkedIn email received: \(email)")
+
+                    // Combine profile and email data
+                    var completeProfile = profileData
+                    completeProfile["email"] = email
+
+                    DispatchQueue.main.async {
+                        self.isAuthenticating = false
+                        // Post notification with LinkedIn profile data
+                        NotificationCenter.default.post(
+                            name: Notification.Name("LinkedInProfileFetched"),
+                            object: nil,
+                            userInfo: ["profile": completeProfile]
+                        )
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        self.error = "Failed to parse LinkedIn email"
+                        self.isAuthenticating = false
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.error = "Failed to decode email response: \(error.localizedDescription)"
+                    self.isAuthenticating = false
+                }
+            }
+        }.resume()
+    }
+
+    // MARK: - LinkedIn Profile Import
+    func importLinkedInProfile(code: String, userId: String, completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        let supabaseURL = "https://jcxvdolcdifdghaibspy.supabase.co"
+        guard let backendURL = URL(string: "\(supabaseURL)/functions/v1/linkedin-import") else {
+            completion(.failure(NSError(domain: "LinkedInImport", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid backend URL"])))
+            return
+        }
+
+        var request = URLRequest(url: backendURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: Any] = [
+            "code": code,
+            "user_id": userId,
+            "redirect_uri": redirectURI
+        ]
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+
+            guard let data = data else {
+                completion(.failure(NSError(domain: "LinkedInImport", code: -2, userInfo: [NSLocalizedDescriptionKey: "No data received"])))
+                return
+            }
+
+            // Check HTTP status
+            if let httpResponse = response as? HTTPURLResponse,
+               httpResponse.statusCode != 200 {
+                if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    var errorMessage = "Import failed"
+                    if let errorMsg = errorJson["error"] as? String {
+                        errorMessage = errorMsg
+                        if let detail = errorJson["detail"] as? String {
+                            errorMessage += ": \(detail)"
+                        }
+                    }
+                    completion(.failure(NSError(domain: "LinkedInImport", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errorMessage])))
+                } else {
+                    completion(.failure(NSError(domain: "LinkedInImport", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "Backend error: \(httpResponse.statusCode)"])))
+                }
+                return
+            }
+
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let success = json["success"] as? Bool, success,
+                   let profile = json["profile"] as? [String: Any] {
+                    completion(.success(profile))
+                } else {
+                    completion(.failure(NSError(domain: "LinkedInImport", code: -3, userInfo: [NSLocalizedDescriptionKey: "Invalid response format"])))
+                }
+            } catch {
+                completion(.failure(error))
+            }
+        }.resume()
+    }
+}
+
+extension LinkedInAuthManager: ASWebAuthenticationPresentationContextProviding {
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        // Modern approach: Get key window from connected scenes
+        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+           let window = windowScene.windows.first(where: { $0.isKeyWindow }) {
+            return window
+        }
+        // Fallback for older iOS versions
+        return UIApplication.shared.windows.first ?? ASPresentationAnchor()
+    }
+}
+
 // MARK: - User Model
 struct AppUser: Codable, Identifiable {
     let id: String
@@ -943,7 +1348,7 @@ class AuthManager: ObservableObject {
     /// Update profile setup completion status
     func updateProfileSetupCompleted(_ completed: Bool) {
         guard let user = currentUser else { return }
-        
+
         let updatedUser = AppUser(
             id: user.id,
             email: user.email,
@@ -954,8 +1359,49 @@ class AuthManager: ObservableObject {
             proEnd: user.proEnd,
             likesRemaining: user.likesRemaining
         )
-        
+
         saveUser(updatedUser)
+    }
+
+    // MARK: - LinkedIn Profile Import
+    func confirmLinkedInProfile(importId: String, name: String?, email: String?, avatarUrl: String?, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard let user = currentUser else {
+            completion(.failure(NSError(domain: "LinkedInConfirm", code: -1, userInfo: [NSLocalizedDescriptionKey: "No current user"])))
+            return
+        }
+
+        Task {
+            do {
+                // Update linkedin_profiles status to 'confirmed'
+                try await supabaseService?.updateLinkedInProfileStatus(importId: importId, status: "confirmed")
+
+                // Update main users table with confirmed data
+                var updateData: [String: Any] = [:]
+                if let name = name, !name.isEmpty {
+                    updateData["name"] = name
+                }
+                if let email = email, !email.isEmpty {
+                    updateData["email"] = email
+                }
+                if let avatarUrl = avatarUrl, !avatarUrl.isEmpty {
+                    updateData["avatar_url"] = avatarUrl
+                }
+
+                if !updateData.isEmpty {
+                    try await supabaseService?.updateUser(id: user.id, data: updateData)
+                }
+
+                // Log confirmation action
+                try await supabaseService?.logLinkedInImportAction(importId: importId, action: "user_confirmed", detail: ["confirmed_by": user.id])
+
+                // Refresh user data
+                await refreshUser()
+
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        }
     }
     
     // MARK: - Validation Helpers

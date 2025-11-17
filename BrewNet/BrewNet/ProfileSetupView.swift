@@ -126,6 +126,14 @@ struct ProfileSetupView: View {
                 // Save Button
                 Button(action: {
                     guard !isNavigating && !isLoading else { return }
+
+                    // Validate current step before saving
+                    let validation = validateCurrentStep()
+                    if !validation.isValid {
+                        showAlert(message: validation.errorMessage)
+                        return
+                    }
+
                     saveCurrentStep()
                 }) {
                     Text("Save")
@@ -154,10 +162,17 @@ struct ProfileSetupView: View {
                         print("⚠️ Button clicked but isNavigating=\(isNavigating) or isLoading=\(isLoading)")
                         return
                     }
-                    
+
+                    // Validate current step before proceeding
+                    let validation = validateCurrentStep()
+                    if !validation.isValid {
+                        showAlert(message: validation.errorMessage)
+                        return
+                    }
+
                     print("🔘 Button clicked: currentStep=\(currentStep), totalSteps=\(totalSteps)")
                     isNavigating = true
-                    
+
                     if currentStep == totalSteps {
                         print("✅ Calling completeProfileSetup()...")
                         completeProfileSetup()
@@ -396,7 +411,84 @@ struct ProfileSetupView: View {
         default: return ""
         }
     }
-    
+
+    // MARK: - Validation
+    private func validateCurrentStep() -> (isValid: Bool, errorMessage: String) {
+        switch currentStep {
+        case 1:
+            return validateCoreIdentityStep()
+        case 2:
+            return validateProfessionalBackgroundStep()
+        case 3:
+            return validateNetworkingIntentionStep()
+        case 4:
+            return validateNetworkingPreferencesStep()
+        case 5:
+            return validatePersonalitySocialStep()
+        case 6:
+            return validateWorkAndLifestylePhotosStep()
+        case 7:
+            return validatePrivacyTrustStep()
+        default:
+            return (true, "")
+        }
+    }
+
+    private func validateCoreIdentityStep() -> (isValid: Bool, errorMessage: String) {
+        var missingFields: [String] = []
+
+        if profileData.coreIdentity?.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+            missingFields.append("Full Name")
+        }
+
+        if profileData.coreIdentity?.email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+            missingFields.append("Email Address")
+        }
+
+        if missingFields.isEmpty {
+            return (true, "")
+        } else {
+            let fieldsText = missingFields.joined(separator: ", ")
+            return (false, "Please fill in the following required fields: \(fieldsText)")
+        }
+    }
+
+    private func validateProfessionalBackgroundStep() -> (isValid: Bool, errorMessage: String) {
+        if profileData.professionalBackground?.industry == nil || profileData.professionalBackground?.industry?.isEmpty ?? true {
+            return (false, "Please select your industry")
+        }
+        return (true, "")
+    }
+
+    private func validateNetworkingIntentionStep() -> (isValid: Bool, errorMessage: String) {
+        if profileData.networkingIntention?.selectedSubIntentions.isEmpty ?? true {
+            return (false, "Please select at least one networking intention")
+        }
+        return (true, "")
+    }
+
+    private func validateNetworkingPreferencesStep() -> (isValid: Bool, errorMessage: String) {
+        // This step has no required fields
+        return (true, "")
+    }
+
+    private func validatePersonalitySocialStep() -> (isValid: Bool, errorMessage: String) {
+        if profileData.personalitySocial?.valuesTags.isEmpty ?? true {
+            return (false, "Please select at least one value that describes you")
+        }
+        return (true, "")
+    }
+
+    private func validateWorkAndLifestylePhotosStep() -> (isValid: Bool, errorMessage: String) {
+        // This step has no required fields
+        return (true, "")
+    }
+
+    private func validatePrivacyTrustStep() -> (isValid: Bool, errorMessage: String) {
+        // This step has no required fields
+        return (true, "")
+    }
+
     // MARK: - Profile Completion
     // MARK: - Save Current Step
     private func saveCurrentStep() {
@@ -768,9 +860,53 @@ struct CoreIdentityStep: View {
     @State private var profileImageData: Data? = nil
     @State private var profileImageURL: String? = nil
     @State private var isUploadingImage = false
-    
+
+    // LinkedIn Import
+    @EnvironmentObject var linkedInAuthManager: LinkedInAuthManager
+    @State private var linkedinConsent = false
+    @State private var isImportingLinkedIn = false
+    @State private var linkedinProfileData: [String: Any]? = nil
+    @State private var showLinkedInConsentAlert = false
+    @State private var linkedinProfileUrlInput = ""
+    @State private var isScrapingLinkedIn = false
+    @State private var showLinkedInPreview = false
+    @State private var isConfirmingLinkedIn = false
+
     var body: some View {
         VStack(spacing: 20) {
+            // Listen for LinkedIn authorization code
+            let _ = NotificationCenter.default.addObserver(
+                forName: Notification.Name("LinkedInCodeReceived"),
+                object: nil,
+                queue: .main
+            ) { notification in
+                if let code = notification.userInfo?["code"] as? String {
+                    handleLinkedInImport(code: code)
+                }
+            }
+
+            // Listen for LinkedIn profile data (legacy)
+            let _ = NotificationCenter.default.addObserver(
+                forName: Notification.Name("LinkedInProfileFetched"),
+                object: nil,
+                queue: .main
+            ) { notification in
+                if let profile = notification.userInfo?["profile"] as? [String: Any] {
+                    linkedinProfileData = profile
+                    isImportingLinkedIn = false
+                }
+            }
+
+            // Listen for LinkedIn import failure
+            let _ = NotificationCenter.default.addObserver(
+                forName: Notification.Name("LinkedInProfileFailed"),
+                object: nil,
+                queue: .main
+            ) { _ in
+                // 导入失败时，停止 loading，让用户可以继续填写 Profile Setup
+                isImportingLinkedIn = false
+            }
+
             // Profile Image Upload
             VStack(spacing: 12) {
                 Text("Profile Picture")
@@ -874,7 +1010,154 @@ struct CoreIdentityStep: View {
                 }
             }
             .padding(.bottom, 8)
-            
+
+            // LinkedIn Profile Import
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Import from LinkedIn")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundColor(Color(red: 0.4, green: 0.2, blue: 0.1))
+
+                // Consent Checkbox
+                HStack(alignment: .top, spacing: 8) {
+                    Button(action: {
+                        linkedinConsent.toggle()
+                    }) {
+                        Image(systemName: linkedinConsent ? "checkmark.square.fill" : "square")
+                            .foregroundColor(linkedinConsent ? Color(red: 0.6, green: 0.4, blue: 0.2) : .gray)
+                            .font(.system(size: 18))
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("I consent to BrewNet accessing my public LinkedIn profile to import my professional information.")
+                            .font(.system(size: 14))
+                            .foregroundColor(.gray)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text("By checking this box, you agree to allow BrewNet to fetch and use your public LinkedIn profile data for profile setup purposes only.")
+                            .font(.system(size: 12))
+                            .foregroundColor(.gray.opacity(0.7))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                if linkedinConsent {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Button(action: {
+                            importLinkedInProfile()
+                        }) {
+                            HStack {
+                                if isImportingLinkedIn {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                        .scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: "link")
+                                        .font(.system(size: 16))
+                                }
+                                Text(isImportingLinkedIn ? "Connecting..." : "Sign in with LinkedIn")
+                                    .font(.system(size: 14, weight: .medium))
+                            }
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(isImportingLinkedIn ? Color.gray : Color(red: 0.6, green: 0.4, blue: 0.2))
+                            .cornerRadius(8)
+                        }
+                        .disabled(isImportingLinkedIn)
+
+                        // Optional: Manual profile URL input for scraping
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Or enter your LinkedIn profile URL to fetch additional data:")
+                                .font(.system(size: 12))
+                                .foregroundColor(.gray)
+                            
+                            HStack(spacing: 8) {
+                                TextField("https://www.linkedin.com/in/yourprofile", text: Binding(
+                                    get: { linkedinProfileUrlInput },
+                                    set: { linkedinProfileUrlInput = $0 }
+                                ))
+                                .textFieldStyle(CustomTextFieldStyle())
+                                .keyboardType(.URL)
+                                .autocapitalization(.none)
+                                .disabled(isImportingLinkedIn)
+                                
+                                Button(action: {
+                                    scrapeLinkedInProfile()
+                                }) {
+                                    if isScrapingLinkedIn {
+                                        ProgressView()
+                                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                            .scaleEffect(0.8)
+                                    } else {
+                                        Text("Fetch")
+                                            .font(.system(size: 12, weight: .medium))
+                                    }
+                                }
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(linkedinProfileUrlInput.isEmpty || isScrapingLinkedIn ? Color.gray : Color(red: 0.6, green: 0.4, blue: 0.2))
+                                .cornerRadius(6)
+                                .disabled(linkedinProfileUrlInput.isEmpty || isScrapingLinkedIn)
+                            }
+                        }
+                        .padding(.top, 4)
+
+                        if let error = linkedInAuthManager.error {
+                            Text(error)
+                                .font(.system(size: 12))
+                                .foregroundColor(.red)
+                        }
+                    }
+                }
+
+                // Display imported LinkedIn data
+                if let linkedinData = linkedinProfileData {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Imported LinkedIn Data:")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(Color(red: 0.4, green: 0.2, blue: 0.1))
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            if let name = linkedinData["localizedFirstName"] as? String,
+                               let lastName = linkedinData["localizedLastName"] as? String {
+                                Text("Name: \(name) \(lastName)")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.gray)
+                            }
+
+                            if let headline = linkedinData["localizedHeadline"] as? String, !headline.isEmpty {
+                                Text("Headline: \(headline)")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.gray)
+                            }
+
+                            if let email = linkedinData["email"] as? String {
+                                Text("Email: \(email)")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.gray)
+                            }
+                        }
+                        .padding(12)
+                        .background(Color.gray.opacity(0.1))
+                        .cornerRadius(8)
+
+                        Button(action: {
+                            applyLinkedInData()
+                        }) {
+                            Text("Apply This Data")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 8)
+                                .background(Color(red: 0.6, green: 0.4, blue: 0.2))
+                                .cornerRadius(8)
+                        }
+                    }
+                }
+            }
+            .padding(.vertical, 8)
+
             // Name
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
@@ -1039,7 +1322,7 @@ struct CoreIdentityStep: View {
                         .font(.system(size: 16, weight: .medium))
                         .foregroundColor(Color(red: 0.4, green: 0.2, blue: 0.1))
                     
-                    Text("(LinkedIn, GitHub, etc.)")
+                    Text("(GitHub, etc.)")
                         .font(.system(size: 12))
                         .foregroundColor(.gray)
                 }
@@ -1288,6 +1571,226 @@ struct CoreIdentityStep: View {
         }
         
         return nil
+    }
+
+    // MARK: - LinkedIn Profile Import Functions
+    private func importLinkedInProfile() {
+        guard linkedinConsent else {
+            showLinkedInConsentAlert = true
+            return
+        }
+
+        isImportingLinkedIn = true
+        linkedInAuthManager.error = nil
+
+        // Start LinkedIn OAuth flow to get authorization code
+        linkedInAuthManager.startLinkedInLogin()
+    }
+
+    // Handle LinkedIn import with new backend
+    private func handleLinkedInImport(code: String) {
+        guard let userId = authManager.currentUser?.id else {
+            linkedInAuthManager.error = "User not authenticated"
+            isImportingLinkedIn = false
+            return
+        }
+
+        linkedInAuthManager.importLinkedInProfile(code: code, userId: userId) { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let profileData):
+                    // Store the imported data for preview/confirmation
+                    linkedinProfileData = profileData
+                    isImportingLinkedIn = false
+                    // Show preview screen for user confirmation
+                    showLinkedInPreview = true
+                case .failure(let error):
+                    linkedInAuthManager.error = error.localizedDescription
+                    isImportingLinkedIn = false
+                }
+            }
+        }
+    }
+
+    private func confirmLinkedInProfile(name: String?, email: String?, avatarUrl: String?) {
+        guard let importId = linkedinProfileData?["id"] as? String else {
+            linkedInAuthManager.error = "Invalid import data"
+            return
+        }
+
+        isConfirmingLinkedIn = true
+
+        authManager.confirmLinkedInProfile(
+            importId: importId,
+            name: name,
+            email: email,
+            avatarUrl: avatarUrl
+        ) { result in
+            DispatchQueue.main.async {
+                isConfirmingLinkedIn = false
+                switch result {
+                case .success:
+                    // Apply the confirmed data to the form
+                    if let name = name {
+                        self.name = name
+                    }
+                    if let email = email {
+                        self.email = email
+                    }
+                    if let avatarUrl = avatarUrl {
+                        self.profileImageURL = avatarUrl
+                    }
+
+                    // Close preview and clear data
+                    showLinkedInPreview = false
+                    linkedinProfileData = nil
+
+                    // Show success message
+                    linkedInAuthManager.error = nil
+                case .failure(let error):
+                    linkedInAuthManager.error = "Failed to confirm profile: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func applyLinkedInData() {
+        guard let linkedinData = linkedinProfileData else { return }
+
+        // Apply name
+        if let firstName = linkedinData["localizedFirstName"] as? String,
+           let lastName = linkedinData["localizedLastName"] as? String {
+            name = "\(firstName) \(lastName)"
+        }
+
+        // Apply email
+        if let email = linkedinData["email"] as? String {
+            self.email = email
+        }
+
+        // Apply bio (headline)
+        if let headline = linkedinData["localizedHeadline"] as? String {
+            bio = headline
+        }
+
+        // Clear the imported data and show success
+        linkedinProfileData = nil
+        linkedInAuthManager.error = nil
+    }
+    
+    private func scrapeLinkedInProfile() {
+        guard !linkedinProfileUrlInput.isEmpty else { return }
+        
+        // Validate URL format
+        guard linkedinProfileUrlInput.contains("linkedin.com/in/") else {
+            linkedInAuthManager.error = "Please enter a valid LinkedIn profile URL"
+            return
+        }
+        
+        isScrapingLinkedIn = true
+        linkedInAuthManager.error = nil
+        
+        Task {
+            do {
+                let supabaseURL = "https://jcxvdolcdifdghaibspy.supabase.co"
+                guard let scraperURL = URL(string: "\(supabaseURL)/functions/v1/linkedin-scraper") else {
+                    await MainActor.run {
+                        linkedInAuthManager.error = "Invalid scraper URL"
+                        isScrapingLinkedIn = false
+                    }
+                    return
+                }
+                
+                var request = URLRequest(url: scraperURL)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                
+                let body: [String: Any] = [
+                    "profileUrl": linkedinProfileUrlInput
+                ]
+                
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                
+                let (data, response) = try await URLSession.shared.data(for: request)
+                
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    await MainActor.run {
+                        linkedInAuthManager.error = "Invalid response from server"
+                        isScrapingLinkedIn = false
+                    }
+                    return
+                }
+                
+                if httpResponse.statusCode == 200 {
+                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let scraperData = json["data"] as? [String: Any] {
+                        
+                        // Merge scraped data with existing profile data
+                        var mergedData = linkedinProfileData ?? [:]
+                        
+                        // Add scraped headline if available
+                        if let headline = scraperData["headline"] as? String {
+                            mergedData["localizedHeadline"] = headline
+                        }
+                        
+                        // Add scraped location if available
+                        if let location = scraperData["location"] as? String {
+                            mergedData["location"] = location
+                        }
+                        
+                        // Add scraped about/bio if available
+                        if let about = scraperData["about"] as? String {
+                            mergedData["about"] = about
+                        }
+                        
+                        // Add scraped experience if available
+                        if let experience = scraperData["experience"] as? [[String: Any]] {
+                            mergedData["experience"] = experience
+                        }
+                        
+                        // Add scraped education if available
+                        if let education = scraperData["education"] as? [[String: Any]] {
+                            mergedData["education"] = education
+                        }
+                        
+                        // Add scraped skills if available
+                        if let skills = scraperData["skills"] as? [String] {
+                            mergedData["skills"] = skills
+                        }
+                        
+                        // Add profile URL
+                        mergedData["profileUrl"] = linkedinProfileUrlInput
+                        
+                        await MainActor.run {
+                            linkedinProfileData = mergedData
+                            isScrapingLinkedIn = false
+                            linkedInAuthManager.error = nil
+                        }
+                    } else {
+                        await MainActor.run {
+                            linkedInAuthManager.error = "Failed to parse scraper response"
+                            isScrapingLinkedIn = false
+                        }
+                    }
+                } else {
+                    let errorText = String(data: data, encoding: .utf8) ?? "Unknown error"
+                    await MainActor.run {
+                        if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let errorMsg = errorJson["error"] as? String {
+                            linkedInAuthManager.error = errorMsg
+                        } else {
+                            linkedInAuthManager.error = "Scraper failed: \(errorText)"
+                        }
+                        isScrapingLinkedIn = false
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    linkedInAuthManager.error = "Failed to scrape profile: \(error.localizedDescription)"
+                    isScrapingLinkedIn = false
+                }
+            }
+        }
     }
 }
 
@@ -1542,6 +2045,19 @@ struct ProfessionalBackgroundStep: View {
         .onChange(of: languages) { _ in updateProfileData() }
         .onChange(of: educations) { _ in updateProfileData() }
         .onChange(of: workExperiences) { _ in updateProfileData() }
+        // LinkedIn Preview Sheet
+        .sheet(isPresented: $showLinkedInPreview) {
+            LinkedInPreviewView(
+                linkedinData: linkedinProfileData ?? [:],
+                onConfirm: { confirmedName, confirmedEmail, confirmedAvatarUrl in
+                    confirmLinkedInProfile(name: confirmedName, email: confirmedEmail, avatarUrl: confirmedAvatarUrl)
+                },
+                onCancel: {
+                    showLinkedInPreview = false
+                    linkedinProfileData = nil
+                }
+            )
+        }
         .sheet(isPresented: $showAddEducation) {
             AddEducationView { newEducation in
                 educations.append(newEducation)
@@ -4218,6 +4734,206 @@ struct AddEducationView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - LinkedIn Preview View
+struct LinkedInPreviewView: View {
+    let linkedinData: [String: Any]
+    let onConfirm: (String?, String?, String?) -> Void
+    let onCancel: () -> Void
+
+    @State private var editedName: String = ""
+    @State private var editedEmail: String = ""
+    @State private var editedAvatarUrl: String = ""
+    @State private var isConfirming = false
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: 24) {
+                    // Header
+                    VStack(spacing: 8) {
+                        Text("Review LinkedIn Data")
+                            .font(.system(size: 24, weight: .bold))
+                            .foregroundColor(Color(red: 0.4, green: 0.2, blue: 0.1))
+
+                        Text("Please review and edit the imported data before confirming.")
+                            .font(.system(size: 16))
+                            .foregroundColor(.gray)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                    }
+
+                    // Profile Preview
+                    VStack(spacing: 16) {
+                        // Avatar
+                        if let avatarUrl = linkedinData["avatarUrl"] as? String, !avatarUrl.isEmpty {
+                            AsyncImage(url: URL(string: avatarUrl)) { phase in
+                                switch phase {
+                                case .success(let image):
+                                    image
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fill)
+                                        .frame(width: 80, height: 80)
+                                        .clipShape(Circle())
+                                        .overlay(
+                                            Circle()
+                                                .stroke(Color(red: 0.6, green: 0.4, blue: 0.2), lineWidth: 3)
+                                        )
+                                case .failure(_):
+                                    Image(systemName: "person.circle.fill")
+                                        .resizable()
+                                        .frame(width: 80, height: 80)
+                                        .foregroundColor(.gray)
+                                case .empty:
+                                    ProgressView()
+                                        .frame(width: 80, height: 80)
+                                @unknown default:
+                                    Image(systemName: "person.circle.fill")
+                                        .resizable()
+                                        .frame(width: 80, height: 80)
+                                        .foregroundColor(.gray)
+                                }
+                            }
+                        } else {
+                            Image(systemName: "person.circle.fill")
+                                .resizable()
+                                .frame(width: 80, height: 80)
+                                .foregroundColor(.gray)
+                        }
+
+                        // Name
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Full Name")
+                                .font(.system(size: 16, weight: .medium))
+                                .foregroundColor(Color(red: 0.4, green: 0.2, blue: 0.1))
+
+                            TextField("Enter your full name", text: $editedName)
+                                .textFieldStyle(CustomTextFieldStyle())
+                        }
+
+                        // Email
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Email Address")
+                                .font(.system(size: 16, weight: .medium))
+                                .foregroundColor(Color(red: 0.4, green: 0.2, blue: 0.1))
+
+                            TextField("Enter your email", text: $editedEmail)
+                                .textFieldStyle(CustomTextFieldStyle())
+                                .keyboardType(.emailAddress)
+                                .autocapitalization(.none)
+                        }
+
+                        // Headline
+                        if let headline = linkedinData["headline"] as? String, !headline.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Professional Headline")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundColor(Color(red: 0.4, green: 0.2, blue: 0.1))
+
+                                Text(headline)
+                                    .font(.system(size: 14))
+                                    .foregroundColor(.gray)
+                                    .padding()
+                                    .background(Color.gray.opacity(0.1))
+                                    .cornerRadius(8)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+
+                        // LinkedIn Profile URL
+                        if let profileUrl = linkedinData["profileUrl"] as? String, !profileUrl.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("LinkedIn Profile")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundColor(Color(red: 0.4, green: 0.2, blue: 0.1))
+
+                                Link(profileUrl, destination: URL(string: profileUrl)!)
+                                    .font(.system(size: 14))
+                                    .foregroundColor(Color(red: 0.6, green: 0.4, blue: 0.2))
+                            }
+                        }
+
+                        // Tags (if available)
+                        if let tags = linkedinData["tags"] as? [String], !tags.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Extracted Tags")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundColor(Color(red: 0.4, green: 0.2, blue: 0.1))
+
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: 8) {
+                                        ForEach(tags, id: \.self) { tag in
+                                            Text(tag)
+                                                .font(.system(size: 12))
+                                                .foregroundColor(Color(red: 0.6, green: 0.4, blue: 0.2))
+                                                .padding(.horizontal, 12)
+                                                .padding(.vertical, 6)
+                                                .background(Color(red: 0.6, green: 0.4, blue: 0.2).opacity(0.1))
+                                                .cornerRadius(16)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                }
+                .padding(.vertical)
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") {
+                        onCancel()
+                    }
+                    .disabled(isConfirming)
+                }
+
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(action: {
+                        isConfirming = true
+                        onConfirm(
+                            editedName.isEmpty ? nil : editedName,
+                            editedEmail.isEmpty ? nil : editedEmail,
+                            editedAvatarUrl.isEmpty ? nil : editedAvatarUrl
+                        )
+                    }) {
+                        if isConfirming {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                        } else {
+                            Text("Confirm & Import")
+                                .font(.system(size: 16, weight: .medium))
+                        }
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(isConfirming ? Color.gray : Color(red: 0.6, green: 0.4, blue: 0.2))
+                    .cornerRadius(8)
+                    .disabled(isConfirming || (editedName.isEmpty && editedEmail.isEmpty))
+                }
+            }
+        }
+        .onAppear {
+            // Initialize with imported data
+            editedName = (linkedinData["fullName"] as? String) ?? ""
+            editedEmail = (linkedinData["email"] as? String) ?? ""
+            editedAvatarUrl = (linkedinData["avatarUrl"] as? String) ?? ""
+        }
+    }
+}
+
+// MARK: - Custom TextField Style
+struct CustomTextFieldStyle: TextFieldStyle {
+    func _body(configuration: TextField<Self._Label>) -> some View {
+        configuration
+            .padding()
+            .background(Color.gray.opacity(0.1))
+            .cornerRadius(8)
+            .foregroundColor(.black)
     }
 }
 

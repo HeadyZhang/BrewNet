@@ -479,8 +479,8 @@ class SupabaseService: ObservableObject {
             try await client.storage
                 .from("avatars")
                 .upload(
-                    path: filePath,
-                    file: imageData,
+                    filePath,
+                    data: imageData,
                     options: FileOptions(
                         cacheControl: "3600",
                         contentType: "image/\(fileExtension == "jpg" ? "jpeg" : fileExtension)"
@@ -533,8 +533,8 @@ class SupabaseService: ObservableObject {
             try await client.storage
                 .from("avatars") // 使用现有的 avatars bucket 用于存储工作照片和生活照片
                 .upload(
-                    path: filePath,
-                    file: imageData,
+                    filePath,
+                    data: imageData,
                     options: FileOptions(
                         cacheControl: "3600",
                         contentType: "image/jpeg"
@@ -5494,7 +5494,7 @@ extension SupabaseService {
         let response = try await client
             .from("user_features")
             .select("activity_score, connect_score, mentor_score")
-            .eq("user_id", userId)
+            .eq("user_id", value: userId)
             .single()
             .execute()
 
@@ -5519,21 +5519,35 @@ extension SupabaseService {
         matches7d: Int,
         lastActiveAt: Date = Date()
     ) async throws {
-        let updateData: [String: AnyEncodableValue] = [
-            "activity_score": .int(activityScore),
-            "connect_score": .int(connectScore),
-            "mentor_score": .int(mentorScore),
-            "sessions_7d": .int(sessions7d),
-            "messages_sent_7d": .int(messagesSent7d),
-            "matches_7d": .int(matches7d),
-            "last_active_at": .string(lastActiveAt.ISO8601Format()),
-            "updated_at": .string(Date().ISO8601Format())
+        let formatter = ISO8601DateFormatter()
+        let lastActiveAtString = formatter.string(from: lastActiveAt)
+        let updatedAtString = formatter.string(from: Date())
+        
+        // 在字典外部创建 AnyJSON 值（因为 AnyJSON 初始化器可能抛出错误）
+        let activityScoreJSON = try AnyJSON(activityScore)
+        let connectScoreJSON = try AnyJSON(connectScore)
+        let mentorScoreJSON = try AnyJSON(mentorScore)
+        let sessions7dJSON = try AnyJSON(sessions7d)
+        let messagesSent7dJSON = try AnyJSON(messagesSent7d)
+        let matches7dJSON = try AnyJSON(matches7d)
+        let lastActiveAtJSON = try AnyJSON(lastActiveAtString)
+        let updatedAtJSON = try AnyJSON(updatedAtString)
+        
+        let updateData: [String: AnyJSON] = [
+            "activity_score": activityScoreJSON,
+            "connect_score": connectScoreJSON,
+            "mentor_score": mentorScoreJSON,
+            "sessions_7d": sessions7dJSON,
+            "messages_sent_7d": messagesSent7dJSON,
+            "matches_7d": matches7dJSON,
+            "last_active_at": lastActiveAtJSON,
+            "updated_at": updatedAtJSON
         ]
 
         try await client
             .from("user_features")
             .update(updateData)
-            .eq("user_id", userId)
+            .eq("user_id", value: userId)
             .execute()
     }
 
@@ -5544,15 +5558,22 @@ extension SupabaseService {
         profile: BrewNetProfile? = nil
     ) async throws {
         // 更新最后活跃时间
-        let updateData: [String: AnyEncodableValue] = [
-            "last_active_at": .string(Date().ISO8601Format()),
-            "updated_at": .string(Date().ISO8601Format())
+        let formatter = ISO8601DateFormatter()
+        let nowString = formatter.string(from: Date())
+        
+        // 在字典外部创建 AnyJSON 值（因为 AnyJSON 初始化器可能抛出错误）
+        let lastActiveAtJSON = try AnyJSON(nowString)
+        let updatedAtJSON = try AnyJSON(nowString)
+        
+        let updateData: [String: AnyJSON] = [
+            "last_active_at": lastActiveAtJSON,
+            "updated_at": updatedAtJSON
         ]
 
         try await client
             .from("user_features")
             .update(updateData)
-            .eq("user_id", userId)
+            .eq("user_id", value: userId)
             .execute()
 
         // 如果有BehavioralMetricsService，触发行为指标重新计算
@@ -5636,9 +5657,9 @@ extension SupabaseService {
                 user_id, mentor_score, skills_to_teach,
                 profiles!inner(user_id, core_identity, professional_background, networking_intention)
             """)
-            .neq("user_id", userId) // 排除自己
-            .gte("mentor_score", minMentorScore)
-            .not("skills_to_teach", "is", "null")
+            .neq("user_id", value: userId) // 排除自己
+            .gte("mentor_score", value: minMentorScore)
+            .not("skills_to_teach", operator: .is, value: "null")
             .limit(limit)
             .execute()
 
@@ -5647,6 +5668,37 @@ extension SupabaseService {
         print("✅ Found \(profiles.count) mentor candidates")
 
         return profiles
+    }
+
+    // MARK: - LinkedIn Profile Import Methods
+    func updateLinkedInProfileStatus(importId: String, status: String) async throws {
+        try await client
+            .from("linkedin_profiles")
+            .update(["import_status": status, "updated_at": "now()"])
+            .eq("id", value: importId)
+            .execute()
+    }
+
+    func updateUser(id: String, data: [String: Any]) async throws {
+        try await client
+            .from("users")
+            .update(data)
+            .eq("id", value: id)
+            .execute()
+    }
+
+    func logLinkedInImportAction(importId: String, action: String, detail: [String: Any]) async throws {
+        let auditData: [String: Any] = [
+            "linkedin_profile_id": importId,
+            "action": action,
+            "detail": detail,
+            "created_at": "now()"
+        ]
+
+        try await client
+            .from("linkedin_import_audit")
+            .insert(auditData)
+            .execute()
     }
 }
 
